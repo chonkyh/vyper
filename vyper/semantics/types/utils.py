@@ -156,7 +156,7 @@ def get_type_from_annotation(
     Arguments
     ---------
     node : VyperNode
-        Vyper ast node from the `annotation` member of an `AnnAssign` node.
+        Vyper ast node from the `annotation` member of a `VariableDef` or `AnnAssign` node.
 
     Returns
     -------
@@ -183,7 +183,11 @@ def get_type_from_annotation(
             f"No builtin or user-defined type named '{type_name}'. {suggestions_str}", node
         ) from None
 
-    if getattr(type_obj, "_as_array", False) and isinstance(node, vy_ast.Subscript):
+    if (
+        getattr(type_obj, "_as_array", False)
+        and isinstance(node, vy_ast.Subscript)
+        and node.value.get("id") != "DynArray"
+    ):
         # TODO: handle `is_immutable` for arrays
         # if type can be an array and node is a subscript, create an `ArrayDefinition`
         length = get_index_value(node.slice)
@@ -222,6 +226,10 @@ def check_constant(node: vy_ast.VyperNode) -> bool:
         if len(args) == 1 and isinstance(args[0], vy_ast.Dict):
             return all(check_constant(v) for v in args[0].values)
 
+        call_type = get_exact_type_from_node(node.func)
+        if getattr(call_type, "_kwargable", False):
+            return True
+
     return False
 
 
@@ -238,24 +246,10 @@ def check_kwargable(node: vy_ast.VyperNode) -> bool:
         if len(args) == 1 and isinstance(args[0], vy_ast.Dict):
             return all(check_kwargable(v) for v in args[0].values)
 
+        call_type = get_exact_type_from_node(node.func)
+        if getattr(call_type, "_kwargable", False):
+            return True
+
     value_type = get_exact_type_from_node(node)
     # is_constant here actually means not_assignable, and is to be renamed
     return getattr(value_type, "is_constant", False)
-
-
-def generate_abi_type(type_definition, name=""):
-    # TODO oof fixme
-    from vyper.semantics.types.user.struct import StructDefinition
-
-    if isinstance(type_definition, StructDefinition):
-        return {
-            "name": name,
-            "type": "tuple",
-            "components": [generate_abi_type(v, k) for k, v in type_definition.members.items()],
-        }
-    if isinstance(type_definition, TupleDefinition):
-        return {
-            "type": "tuple",
-            "components": [generate_abi_type(i) for i in type_definition.value_type],
-        }
-    return {"name": name, "type": type_definition.canonical_abi_type}

@@ -104,18 +104,17 @@ class DecimalTypeInfo(NumericTypeInfo):
     decimals: int
 
     @property
-    def divisor(self) -> Decimal:
-        # TODO reconsider if this API should return int
-        return Decimal(10 ** self.decimals)
+    def divisor(self) -> int:
+        return 10 ** self.decimals
 
     @property
     def epsilon(self) -> Decimal:
-        return 1 / self.divisor
+        return 1 / Decimal(self.divisor)
 
     @property
     def decimal_bounds(self) -> Tuple[Decimal, Decimal]:
         lo, hi = self.bounds
-        DIVISOR = self.divisor
+        DIVISOR = Decimal(self.divisor)
         return lo / DIVISOR, hi / DIVISOR
 
 
@@ -158,6 +157,10 @@ def parse_decimal_info(typename: str) -> DecimalTypeInfo:
     # in the future, this will actually do parsing
     assert typename == "decimal"
     return DecimalTypeInfo(bits=168, decimals=10, is_signed=True)
+
+
+def is_enum_type(t: "NodeType") -> bool:
+    return isinstance(t, EnumType)
 
 
 def _basetype_to_abi_type(t: "BaseType") -> ABIType:
@@ -234,7 +237,12 @@ class EnumType(BaseType):
         self.name = name
         self.members = members
 
+    def __repr__(self):
+        return f"enum {self.name}"
+
     def __eq__(self, other):
+        if type(self) is not type(other):
+            return False
         return self.name == other.name and self.members == other.members
 
     @property

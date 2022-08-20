@@ -18,7 +18,7 @@ from vyper.warnings import ContractSizeLimitWarning
 def build_ast_dict(compiler_data: CompilerData) -> dict:
     ast_dict = {
         "contract_name": compiler_data.contract_name,
-        "ast": ast_to_dict(compiler_data.vyper_module_unfolded),
+        "ast": ast_to_dict(compiler_data.vyper_module),
     }
     return ast_dict
 
@@ -104,6 +104,16 @@ def build_metadata_output(compiler_data: CompilerData) -> dict:
     warnings.warn("metadata output format is unstable!")
     sigs = compiler_data.function_signatures
 
+    def _var_rec_dict(variable_record):
+        ret = vars(variable_record)
+        ret["typ"] = str(ret["typ"])
+        if ret["data_offset"] is None:
+            del ret["data_offset"]
+        for k in ("blockscopes", "defined_at", "encoding"):
+            del ret[k]
+        ret["location"] = ret["location"].name
+        return ret
+
     def _to_dict(sig):
         ret = vars(sig)
         ret["return_type"] = str(ret["return_type"])
@@ -116,6 +126,9 @@ def build_metadata_output(compiler_data: CompilerData) -> dict:
         for k in ret["default_values"]:
             # e.g. {"x": vy_ast.Int(..)} -> {"x": 1}
             ret["default_values"][k] = ret["default_values"][k].node_source_code
+        ret["frame_info"] = vars(ret["frame_info"])
+        for k in ret["frame_info"]["frame_vars"].keys():
+            ret["frame_info"]["frame_vars"][k] = _var_rec_dict(ret["frame_info"]["frame_vars"][k])
         return ret
 
     return {"function_info": {name: _to_dict(sig) for (name, sig) in sigs.items()}}
@@ -163,7 +176,7 @@ def _build_asm(asm_list):
     for node in asm_list:
 
         if isinstance(node, list):
-            output_string += "[ " + _build_asm(node) + "] "
+            output_string += "{ " + _build_asm(node) + "} "
             continue
 
         if in_push > 0:
@@ -201,7 +214,7 @@ def build_source_map_output(compiler_data: CompilerData) -> OrderedDict:
 
 def _compress_source_map(code, pos_map, jump_map, source_id):
     linenos = asttokens.LineNumbers(code)
-    compressed_map = f"-1:-1:{source_id}:-;"
+    ret = [f"-1:-1:{source_id}:-"]
     last_pos = [-1, -1, source_id]
 
     for pc in sorted(pos_map)[1:]:
@@ -221,13 +234,17 @@ def _compress_source_map(code, pos_map, jump_map, source_id):
             else:
                 current_pos[i] = ""
 
-        compressed_map += ":".join(str(i) for i in current_pos) + ";"
+        ret.append(":".join(str(i) for i in current_pos))
 
-    return compressed_map
+    return ";".join(ret)
 
 
 def build_bytecode_output(compiler_data: CompilerData) -> str:
     return f"0x{compiler_data.bytecode.hex()}"
+
+
+def build_blueprint_bytecode_output(compiler_data: CompilerData) -> str:
+    return f"0x{compiler_data.blueprint_bytecode.hex()}"
 
 
 # EIP-170. Ref: https://eips.ethereum.org/EIPS/eip-170

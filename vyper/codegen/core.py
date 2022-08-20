@@ -7,6 +7,7 @@ from vyper.codegen.types import (
     BaseType,
     ByteArrayLike,
     DArrayType,
+    EnumType,
     MappingType,
     SArrayType,
     StructType,
@@ -25,7 +26,7 @@ from vyper.utils import GAS_CALLDATACOPY_WORD, GAS_CODECOPY_WORD, GAS_IDENTITY, 
 # propagate revert message when calls to external contracts fail
 def check_external_call(call_ir):
     copy_revertdata = ["returndatacopy", 0, 0, "returndatasize"]
-    revert = ["revert", 0, "returndatasize"]
+    revert = IRnode.from_list(["revert", 0, "returndatasize"], error_msg="external call failed")
 
     propagate_revert_ir = ["seq", copy_revertdata, revert]
     return ["if", ["iszero", call_ir], propagate_revert_ir]
@@ -52,6 +53,7 @@ def make_byte_array_copier(dst, src):
 
     _check_assign_bytes(dst, src)
 
+    # TODO: remove this branch, copy_bytes and get_bytearray_length should handle
     if src.value == "~empty":
         # set length word to 0.
         return STORE(dst, 0)
@@ -120,8 +122,11 @@ def _dynarray_make_setter(dst, src):
         # the layout does not match our memory layout
         should_loop = src.encoding == Encoding.ABI and src.typ.subtype.abi_type.is_dynamic()
 
-        # if the subtype is dynamic, there might be a lot of
-        # unused space inside of each element. for instance
+        # if the data is not validated, we must loop to unpack
+        should_loop |= needs_clamp(src.typ.subtype, src.encoding)
+
+        # performance: if the subtype is dynamic, there might be a lot
+        # of unused space inside of each element. for instance
         # DynArray[DynArray[uint256, 100], 5] where all the child
         # arrays are empty - for this case, we recursively call
         # into make_setter instead of straight bytes copy
@@ -129,7 +134,6 @@ def _dynarray_make_setter(dst, src):
         # loop when subtype.is_dynamic AND location == storage
         # OR array_size <= /bound where loop is cheaper than memcpy/
         should_loop |= src.typ.subtype.abi_type.is_dynamic()
-        should_loop |= needs_clamp(src.typ.subtype, src.encoding)
 
         with get_dyn_array_count(src).cache_when_complex("darray_count") as (b2, count):
             ret = ["seq"]
@@ -180,9 +184,13 @@ def copy_bytes(dst, src, length, length_bound):
         "copy_bytes_count"
     ) as (b2, length), dst.cache_when_complex("dst") as (b3, dst):
 
-        assert length_bound >= 0
+        assert isinstance(length_bound, int) and length_bound >= 0
 
+        # correctness: do not clobber dst
         if length_bound == 0:
+            return IRnode.from_list(["seq"], annotation=annotation)
+        # performance: if we know that length is 0, do not copy anything
+        if length.value == 0:
             return IRnode.from_list(["seq"], annotation=annotation)
 
         assert src.is_pointer and dst.is_pointer
@@ -241,6 +249,9 @@ def copy_bytes(dst, src, length, length_bound):
 # get the number of bytes at runtime
 def get_bytearray_length(arg):
     typ = BaseType("uint256")
+
+    # TODO add "~empty" case to mirror get_dyn_array_count
+
     return IRnode.from_list(LOAD(arg), typ=typ)
 
 
@@ -254,7 +265,7 @@ def get_dyn_array_count(arg):
         return IRnode.from_list(len(arg.args), typ=typ)
 
     if arg.value == "~empty":
-        # empty(DynArray[])
+        # empty(DynArray[...])
         return IRnode.from_list(0, typ=typ)
 
     return IRnode.from_list(LOAD(arg), typ=typ)
@@ -269,7 +280,8 @@ def append_dyn_array(darray_node, elem_node):
     with darray_node.cache_when_complex("darray") as (b1, darray_node):
         len_ = get_dyn_array_count(darray_node)
         with len_.cache_when_complex("old_darray_len") as (b2, len_):
-            ret.append(["assert", ["lt", len_, darray_node.typ.count]])
+            assertion = ["assert", ["lt", len_, darray_node.typ.count]]
+            ret.append(IRnode.from_list(assertion, error_msg=f"{darray_node.typ} bounds check"))
             ret.append(STORE(darray_node, ["add", len_, 1]))
             # NOTE: typechecks elem_node
             # NOTE skip array bounds check bc we already asserted len two lines up
@@ -281,6 +293,7 @@ def append_dyn_array(darray_node, elem_node):
 
 def pop_dyn_array(darray_node, return_popped_item):
     assert isinstance(darray_node.typ, DArrayType)
+    assert darray_node.encoding == Encoding.VYPER
     ret = ["seq"]
     with darray_node.cache_when_complex("darray") as (b1, darray_node):
         old_len = clamp("gt", get_dyn_array_count(darray_node), 0)
@@ -295,12 +308,9 @@ def pop_dyn_array(darray_node, return_popped_item):
                 ret.append(popped_item)
                 typ = popped_item.typ
                 location = popped_item.location
-                encoding = popped_item.encoding
             else:
-                typ, location, encoding = None, None, None
-            return IRnode.from_list(
-                b1.resolve(b2.resolve(ret)), typ=typ, location=location, encoding=encoding
-            )
+                typ, location = None, None
+            return IRnode.from_list(b1.resolve(b2.resolve(ret)), typ=typ, location=location)
 
 
 def getpos(node):
@@ -518,13 +528,31 @@ def LOAD(ptr: IRnode) -> IRnode:
     return IRnode.from_list([op, ptr])
 
 
+def eval_once_check(name):
+    # an IRnode which enforces uniqueness. include with a side-effecting
+    # operation to sanity check that the codegen pipeline only generates
+    # the side-effecting operation once (otherwise, IR-to-assembly will
+    # throw a duplicate label exception). there is no runtime overhead
+    # since the jumpdest gets optimized out in the final stage of assembly.
+    return IRnode.from_list(["unique_symbol", name])
+
+
 def STORE(ptr: IRnode, val: IRnode) -> IRnode:
     if ptr.location is None:
         raise CompilerPanic("cannot dereference non-pointer type")
     op = ptr.location.store_op
     if op is None:
         raise CompilerPanic(f"unreachable {ptr.location}")  # pragma: notest
-    return IRnode.from_list([op, ptr, val])
+
+    _check = _freshname(f"{op}_")
+
+    store = [op, ptr, val]
+    # don't use eval_once_check for memory, immutables because it interferes
+    # with optimizer
+    if ptr.location in (MEMORY, IMMUTABLES):
+        return IRnode.from_list(store)
+
+    return IRnode.from_list(["seq", eval_once_check(_check), store])
 
 
 # Unwrap location
@@ -534,6 +562,7 @@ def unwrap_location(orig):
     else:
         # CMC 2022-03-24 TODO refactor so this branch can be removed
         if orig.value == "~empty":
+            # must be word type
             return IRnode.from_list(0, typ=orig.typ)
         return orig
 
@@ -598,7 +627,7 @@ def _check_assign_bytes(left, right):
 
 
 def _check_assign_list(left, right):
-    def FAIL():  # pragma: nocover
+    def FAIL():  # pragma: no cover
         raise TypeCheckFailure(f"assigning {right.typ} to {left.typ}")
 
     if left.value == "multi":
@@ -632,7 +661,7 @@ def _check_assign_list(left, right):
 
 
 def _check_assign_tuple(left, right):
-    def FAIL():  # pragma: nocover
+    def FAIL():  # pragma: no cover
         raise TypeCheckFailure(f"assigning {right.typ} to {left.typ}")
 
     if not isinstance(right.typ, left.typ.__class__):
@@ -667,7 +696,7 @@ def _check_assign_tuple(left, right):
 # this function is more of a sanity check for typechecking internally
 # generated assignments
 def check_assign(left, right):
-    def FAIL():  # pragma: nocover
+    def FAIL():  # pragma: no cover
         raise TypeCheckFailure(f"assigning {right.typ} to {left.typ} {left} {right}")
 
     if isinstance(left.typ, ByteArrayLike):
@@ -683,7 +712,7 @@ def check_assign(left, right):
         #    FAIL()  # pragma: notest
         pass
 
-    else:  # pragma: nocover
+    else:  # pragma: no cover
         FAIL()
 
 
@@ -697,6 +726,11 @@ def _freshname(name):
     return f"{name}{_label}"
 
 
+def reset_names():
+    global _label
+    _label = 0
+
+
 # returns True if t is ABI encoded and is a type that needs any kind of
 # validation
 def needs_clamp(t, encoding):
@@ -706,6 +740,8 @@ def needs_clamp(t, encoding):
         raise CompilerPanic("unreachable")  # pragma: notest
     if isinstance(t, (ByteArrayLike, DArrayType)):
         return True
+    if isinstance(t, EnumType):
+        return len(t.members) < 256
     if isinstance(t, BaseType):
         return t.typ not in ("int256", "uint256", "bytes32")
     if isinstance(t, SArrayType):
@@ -821,12 +857,9 @@ def eval_seq(ir_node):
 def is_return_from_function(node):
     if isinstance(node, vy_ast.Expr) and node.get("value.func.id") == "selfdestruct":
         return True
-    if isinstance(node, vy_ast.Return):
+    if isinstance(node, (vy_ast.Return, vy_ast.Raise)):
         return True
-    elif isinstance(node, vy_ast.Raise):
-        return True
-    else:
-        return False
+    return False
 
 
 def check_single_exit(fn_node):
@@ -899,23 +932,22 @@ def sar(bits, x):
     if version_check(begin="constantinople"):
         return ["sar", bits, x]
 
-    # emulate for older arches. keep in mind note from EIP 145:
-    # "This is not equivalent to PUSH1 2 EXP SDIV, since it rounds
-    # differently. See SDIV(-1, 2) == 0, while SAR(-1, 1) == -1."
-    return ["sdiv", ["add", ["slt", x, 0], x], ["exp", 2, bits]]
+    raise NotImplementedError("no SAR emulation for pre-constantinople EVM")
 
 
 def clamp_bytestring(ir_node):
     t = ir_node.typ
     if not isinstance(t, ByteArrayLike):
         raise CompilerPanic(f"{t} passed to clamp_bytestring")  # pragma: notest
-    return ["assert", ["le", get_bytearray_length(ir_node), t.maxlen]]
+    ret = ["assert", ["le", get_bytearray_length(ir_node), t.maxlen]]
+    return IRnode.from_list(ret, error_msg=f"{ir_node.typ} bounds check")
 
 
 def clamp_dyn_array(ir_node):
     t = ir_node.typ
     assert isinstance(t, DArrayType)
-    return ["assert", ["le", get_dyn_array_count(ir_node), t.count]]
+    ret = ["assert", ["le", get_dyn_array_count(ir_node), t.count]]
+    return IRnode.from_list(ret, error_msg=f"{ir_node.typ} bounds check")
 
 
 # clampers for basetype
@@ -927,24 +959,31 @@ def clamp_basetype(ir_node):
     # copy of the input
     ir_node = unwrap_location(ir_node)
 
-    if is_integer_type(t) or is_decimal_type(t):
+    if isinstance(t, EnumType):
+        bits = len(t.members)
+        # assert x >> bits == 0
+        ret = int_clamp(ir_node, bits, signed=False)
+
+    elif is_integer_type(t) or is_decimal_type(t):
         if t._num_info.bits == 256:
-            return ir_node
+            ret = ir_node
         else:
-            return int_clamp(ir_node, t._num_info.bits, signed=t._num_info.is_signed)
+            ret = int_clamp(ir_node, t._num_info.bits, signed=t._num_info.is_signed)
 
-    if is_bytes_m_type(t):
+    elif is_bytes_m_type(t):
         if t._bytes_info.m == 32:
-            return ir_node  # special case, no clamp.
+            ret = ir_node  # special case, no clamp.
         else:
-            return bytes_clamp(ir_node, t._bytes_info.m)
+            ret = bytes_clamp(ir_node, t._bytes_info.m)
 
-    if t.typ in ("address",):
-        return int_clamp(ir_node, 160)
-    if t.typ in ("bool",):
-        return int_clamp(ir_node, 1)
+    elif t.typ in ("address",):
+        ret = int_clamp(ir_node, 160)
+    elif t.typ in ("bool",):
+        ret = int_clamp(ir_node, 1)
+    else:  # pragma: no cover
+        raise CompilerPanic(f"{t} passed to clamp_basetype")
 
-    raise CompilerPanic(f"{t} passed to clamp_basetype")  # pragma: notest
+    return IRnode.from_list(ret, typ=ir_node.typ, error_msg=f"validate {t}")
 
 
 def int_clamp(ir_node, bits, signed=False):
@@ -955,6 +994,9 @@ def int_clamp(ir_node, bits, signed=False):
     """
     if bits >= 256:
         raise CompilerPanic(f"invalid clamp: {bits}>=256 ({ir_node})")  # pragma: notest
+
+    u = "u" if not signed else ""
+    msg = f"{u}int{bits} bounds check"
     with ir_node.cache_when_complex("val") as (b, val):
         if signed:
             # example for bits==128:
@@ -967,19 +1009,22 @@ def int_clamp(ir_node, bits, signed=False):
         else:
             assertion = ["assert", ["iszero", shr(bits, val)]]
 
+        assertion = IRnode.from_list(assertion, error_msg=msg)
+
         ret = b.resolve(["seq", assertion, val])
 
-    # TODO fix this annotation
-    return IRnode.from_list(ret, annotation=f"int_clamp {ir_node.typ}")
+    return IRnode.from_list(ret, annotation=msg)
 
 
 def bytes_clamp(ir_node: IRnode, n_bytes: int) -> IRnode:
     if not (0 < n_bytes <= 32):
         raise CompilerPanic(f"bad type: bytes{n_bytes}")
+    msg = f"bytes{n_bytes} bounds check"
     with ir_node.cache_when_complex("val") as (b, val):
-        assertion = ["assert", ["iszero", shl(n_bytes * 8, val)]]
+        assertion = IRnode.from_list(["assert", ["iszero", shl(n_bytes * 8, val)]], error_msg=msg)
         ret = b.resolve(["seq", assertion, val])
-    return IRnode.from_list(ret, annotation=f"bytes{n_bytes}_clamp")
+
+    return IRnode.from_list(ret, annotation=msg)
 
 
 # e.g. for int8, promote 255 to -1
@@ -989,10 +1034,19 @@ def promote_signed_int(x, bits):
     return IRnode.from_list(ret, annotation=f"promote int{bits}")
 
 
+# general clamp function for all ops and numbers
 def clamp(op, arg, bound):
     with IRnode.from_list(arg).cache_when_complex("clamp_arg") as (b1, arg):
-        assertion = ["assert", [op, arg, bound]]
-        ret = ["seq", assertion, arg]
+        check = IRnode.from_list(["assert", [op, arg, bound]], error_msg=f"clamp {op} {bound}")
+        ret = ["seq", check, arg]
+        return IRnode.from_list(b1.resolve(ret), typ=arg.typ)
+
+
+def clamp_nonzero(arg):
+    # TODO: use clamp("ne", arg, 0) once optimizer rules can handle it
+    with IRnode.from_list(arg).cache_when_complex("should_nonzero") as (b1, arg):
+        check = IRnode.from_list(["assert", arg], error_msg="check nonzero")
+        ret = ["seq", check, arg]
         return IRnode.from_list(b1.resolve(ret), typ=arg.typ)
 
 

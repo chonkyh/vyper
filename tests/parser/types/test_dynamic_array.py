@@ -9,7 +9,6 @@ from vyper.exceptions import (
     InvalidType,
     OverflowException,
     StateAccessViolation,
-    StructureException,
     TypeMismatch,
 )
 
@@ -59,6 +58,46 @@ def loo(x: DynArray[DynArray[int128, 2], 2]) -> int128:
     assert c.koo([3, 4, 5]) == 12
     assert c.loo([[1, 2], [3, 4]]) == 73
     print("Passed list tests")
+
+
+def test_string_list(get_contract):
+    code = """
+@external
+def foo1(x: DynArray[String[32], 2]) -> DynArray[String[32], 2]:
+    return x
+
+@external
+def foo2(x: DynArray[DynArray[String[32], 2], 2]) -> DynArray[DynArray[String[32], 2], 2]:
+    return x
+
+@external
+def foo3(x: DynArray[DynArray[String[32], 2], 2]) -> DynArray[String[32], 2]:
+    return x[0]
+
+@external
+def foo4(x: DynArray[DynArray[String[32], 2], 2]) -> String[32]:
+    return x[0][0]
+
+@external
+def foo5() -> DynArray[String[32], 2]:
+    ret: DynArray[String[32], 2] = ["hello"]
+    ret.append("world")
+    return ret
+
+@external
+def foo6() -> DynArray[DynArray[String[32], 2], 2]:
+    ret: DynArray[DynArray[String[32], 2], 2] = []
+    ret.append(["hello", "world"])
+    return ret
+    """
+
+    c = get_contract(code)
+    assert c.foo1(["hello", "world"]) == ["hello", "world"]
+    assert c.foo2([["hello", "world"]]) == [["hello", "world"]]
+    assert c.foo3([["hello", "world"]]) == ["hello", "world"]
+    assert c.foo4([["hello", "world"]]) == "hello"
+    assert c.foo5() == ["hello", "world"]
+    assert c.foo6() == [["hello", "world"]]
 
 
 def test_list_output_tester_code(get_contract_with_gas_estimation):
@@ -377,6 +416,27 @@ def check(a: {type}) -> bool:
     assert c.check(values[0]) is True
     assert c.check(values[1]) is True
     assert c.check(false_value) is False
+
+
+@pytest.mark.parametrize("type_", ("uint256", "bytes32", "address"))
+def test_member_in_empty_list(get_contract_with_gas_estimation, type_):
+    code = f"""
+@external
+def check_in(s: uint128) -> bool:
+    a: {type_} = convert(s, {type_})
+    x: DynArray[{type_}, 2] = []
+    return a in x
+
+@external
+def check_not_in(s: uint128) -> bool:
+    a: {type_} = convert(s, {type_})
+    x: DynArray[{type_}, 2] = []
+    return a not in x
+    """
+    c = get_contract_with_gas_estimation(code)
+    for s in (0, 1, 2, 3):
+        assert c.check_in(s) is False
+        assert c.check_not_in(s) is True
 
 
 @pytest.mark.parametrize(
@@ -1274,6 +1334,66 @@ def foo(x: uint8) -> uint8:
     assert_tx_failed(lambda: c.foo(241))
 
 
+def test_list_of_nested_struct_arrays(get_contract):
+    code = """
+struct Ded:
+    a: uint256[3]
+    b: bool
+
+struct Foo:
+    c: uint256
+    d: uint256
+    e: Ded
+
+struct Bar:
+    f: DynArray[Foo, 3]
+    g: DynArray[uint256, 3]
+
+@external
+def bar(_bar: DynArray[Bar, 3]) -> uint256:
+    sum: uint256 = 0
+    for i in range(3):
+        sum += _bar[i].f[0].e.a[0] * _bar[i].f[1].e.a[1]
+    return sum
+    """
+    c = get_contract(code)
+    c_input = [
+        ((tuple([(123, 456, ([i, i + 1, i + 2], False))] * 3)), [9, 8, 7]) for i in range(1, 4)
+    ]
+
+    assert c.bar(c_input) == 20
+
+
+def test_2d_list_of_struct(get_contract):
+    code = """
+struct Bar:
+    a: uint256
+    b: uint256
+
+@external
+def foo(x: DynArray[DynArray[Bar, 2], 2]) -> uint256:
+    return x[0][0].a + x[1][1].b
+    """
+    c = get_contract(code)
+    c_input = [([i, i * 2], [i * 3, i * 4]) for i in range(1, 3)]
+    assert c.foo(c_input) == 9
+
+
+def test_3d_list_of_struct(get_contract):
+    code = """
+struct Bar:
+    a: uint256
+    b: uint256
+
+@external
+def foo(x: DynArray[DynArray[DynArray[Bar, 2], 2], 2]) -> uint256:
+    return x[0][0][0].a + x[1][1][1].b
+    """
+    c = get_contract(code)
+    c_input = [([([i, i * 2], [i * 3, i * 4]) for i in range(1, 3)])] * 2
+    assert c.foo(c_input) == 9
+
+
 def test_list_of_static_list(get_contract):
     code = """
 @external
@@ -1501,7 +1621,72 @@ def ix(i: uint256) -> decimal:
     assert_tx_failed(lambda: c.ix(len(some_good_primes) + 1))
 
 
-# TODO test loops
+def test_public_dynarray(get_contract):
+    code = """
+my_list: public(DynArray[uint256, 5])
+@external
+def __init__():
+    self.my_list = [1,2,3]
+    """
+    c = get_contract(code)
+
+    for i, t in enumerate([1, 2, 3]):
+        assert c.my_list(i) == t
+
+
+def test_nested_public_dynarray(get_contract):
+    code = """
+my_list: public(DynArray[DynArray[uint256, 5], 5])
+@external
+def __init__():
+    self.my_list = [[1,2,3]]
+    """
+    c = get_contract(code)
+
+    for i, l in enumerate([[1, 2, 3]]):
+        for j, t in enumerate(l):
+            assert c.my_list(i, j) == t
+
+
+@pytest.mark.parametrize(
+    "typ,val",
+    [
+        ("DynArray[DynArray[uint256, 5], 5]", [[], []]),
+        ("DynArray[DynArray[DynArray[uint256, 5], 5], 5]", [[[], []], []]),
+    ],
+)
+def test_empty_nested_dynarray(get_contract, typ, val):
+    code = f"""
+@external
+def foo() -> {typ}:
+    a: {typ} = {val}
+    return a
+    """
+    c = get_contract(code)
+    assert c.foo() == val
+
+
+# TODO test negative public(DynArray) cases?
+
+# CMC 2022-08-04 these are blocked due to typechecker bug; leaving as
+# negative tests so we know if/when the typechecker is fixed.
+# (don't consider it a high priority to fix since membership in
+# in empty list literal seems like something we should plausibly
+# reject at compile-time anyway)
+def test_empty_list_membership_fail(get_contract, assert_compile_failed):
+    code = """
+@external
+def foo(x: uint256) -> bool:
+    return x in []
+    """
+    assert_compile_failed(lambda: get_contract(code))
+    code = """
+@external
+def foo(x: uint256) -> bool:
+    return x not in []
+    """
+    assert_compile_failed(lambda: get_contract(code))
+
 
 # Would be nice to put this somewhere accessible, like in vyper.types or something
 integer_types = ["uint8", "int128", "int256", "uint256"]
@@ -1541,29 +1726,3 @@ def foo(i: uint256) -> {return_type}:
     return MY_CONSTANT[i]
     """
     assert_compile_failed(lambda: get_contract(code), TypeMismatch)
-
-
-INVALID_ARRAY_VALUES = [
-    """
-a: DynArray[Bytes[5], 2]
-    """,
-    """
-a: DynArray[String[5], 2]
-    """,
-    """
-a: DynArray[DynArray[Bytes[5], 2], 2]
-    """,
-    """
-a: DynArray[DynArray[String[5], 2], 2]
-    """,
-]
-
-
-@pytest.mark.parametrize("invalid_contracts", INVALID_ARRAY_VALUES)
-def test_invalid_dyn_array_values(
-    get_contract_with_gas_estimation, assert_compile_failed, invalid_contracts
-):
-
-    assert_compile_failed(
-        lambda: get_contract_with_gas_estimation(invalid_contracts), StructureException
-    )

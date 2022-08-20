@@ -22,10 +22,12 @@ from vyper.codegen.types import (
     BaseType,
     ByteArrayLike,
     ByteArrayType,
+    EnumType,
     StringType,
     is_base_type,
     is_bytes_m_type,
     is_decimal_type,
+    is_enum_type,
     is_integer_type,
 )
 from vyper.exceptions import (
@@ -142,13 +144,13 @@ def _fixed_to_int(arg, out_typ):
     # block inputs which are out of bounds before truncation.
     # e.g., convert(255.1, uint8) should revert or fail to compile.
     out_lo, out_hi = out_info.bounds
-    out_lo = int(out_lo * DIVISOR)
-    out_hi = int(out_hi * DIVISOR)
+    out_lo = out_lo * DIVISOR
+    out_hi = out_hi * DIVISOR
 
     clamped_arg = _clamp_numeric_convert(arg, arg_info.bounds, (out_lo, out_hi), arg_info.is_signed)
 
     assert arg_info.is_signed, "should use unsigned div"  # stub in case we ever add ufixed
-    return IRnode.from_list(["sdiv", clamped_arg, int(DIVISOR)], typ=out_typ)
+    return IRnode.from_list(["sdiv", clamped_arg, DIVISOR], typ=out_typ)
 
 
 # promote from int to fixed point decimal
@@ -160,12 +162,12 @@ def _int_to_fixed(arg, out_typ):
 
     # block inputs which are out of bounds before promotion
     out_lo, out_hi = out_info.bounds
-    out_lo = round_towards_zero(out_lo / DIVISOR)
-    out_hi = round_towards_zero(out_hi / DIVISOR)
+    out_lo = round_towards_zero(out_lo / decimal.Decimal(DIVISOR))
+    out_hi = round_towards_zero(out_hi / decimal.Decimal(DIVISOR))
 
     clamped_arg = _clamp_numeric_convert(arg, arg_info.bounds, (out_lo, out_hi), arg_info.is_signed)
 
-    return IRnode.from_list(["mul", clamped_arg, int(DIVISOR)], typ=out_typ)
+    return IRnode.from_list(["mul", clamped_arg, DIVISOR], typ=out_typ)
 
 
 # clamp for dealing with conversions between int types (from arg to dst)
@@ -247,7 +249,7 @@ def _literal_int(expr, arg_typ, out_typ):
         val = int.from_bytes(expr.value, "big")
     elif isinstance(expr, (vy_ast.Int, vy_ast.Decimal, vy_ast.NameConstant)):
         val = expr.value
-    else:  # pragma: nocover
+    else:  # pragma: no cover
         raise CompilerPanic("unreachable")
 
     if isinstance(expr, (vy_ast.Hex, vy_ast.Bytes)) and int_info.is_signed:
@@ -303,7 +305,6 @@ def to_bool(expr, arg, out_typ):
 
 @_input_types("int", "bytes_m", "decimal", "bytes", "address", "bool")
 def to_int(expr, arg, out_typ):
-
     int_info = out_typ._int_info
 
     assert int_info.bits % 8 == 0
@@ -326,6 +327,11 @@ def to_int(expr, arg, out_typ):
 
     elif is_decimal_type(arg.typ):
         arg = _fixed_to_int(arg, out_typ)
+
+    elif is_enum_type(arg.typ):
+        if not is_base_type(out_typ, "uint256"):
+            _FAIL(arg.typ, out_typ, expr)
+        arg = _int_to_int(arg, out_typ)
 
     elif is_integer_type(arg.typ):
         arg = _int_to_int(arg, out_typ)
@@ -456,12 +462,24 @@ def to_bytes(expr, arg, out_typ):
     return IRnode.from_list(arg, typ=out_typ)
 
 
+@_input_types("int")
+def to_enum(expr, arg, out_typ):
+    if not is_base_type(arg.typ, "uint256"):
+        _FAIL(arg.typ, out_typ, expr)
+
+    if len(out_typ.members) < 256:
+        arg = int_clamp(arg, bits=len(out_typ.members), signed=False)
+
+    return IRnode.from_list(arg, typ=out_typ)
+
+
 def convert(expr, context):
     if len(expr.args) != 2:
         raise StructureException("The convert function expects two parameters.", expr)
 
     arg_ast = expr.args[0]
     arg = Expr(arg_ast, context).ir_node
+    original_arg = arg
     out_typ = context.parse_type(expr.args[1])
 
     if isinstance(arg.typ, BaseType):
@@ -471,6 +489,8 @@ def convert(expr, context):
             ret = to_bool(arg_ast, arg, out_typ)
         elif is_base_type(out_typ, "address"):
             ret = to_address(arg_ast, arg, out_typ)
+        elif isinstance(out_typ, EnumType):
+            ret = to_enum(arg_ast, arg, out_typ)
         elif is_integer_type(out_typ):
             ret = to_int(arg_ast, arg, out_typ)
         elif is_bytes_m_type(out_typ):
@@ -484,6 +504,12 @@ def convert(expr, context):
         else:
             raise StructureException(f"Conversion to {out_typ} is invalid.", arg_ast)
 
-        ret = b.resolve(ret)
+        # test if arg actually changed. if not, we do not need to use
+        # unwrap_location (this can reduce memory traffic for downstream
+        # operations which are in-place, like the returndata routine)
+        test_arg = IRnode.from_list(arg, typ=out_typ)
+        if test_arg == ret:
+            original_arg.typ = out_typ
+            return original_arg
 
-    return IRnode.from_list(ret)
+        return IRnode.from_list(b.resolve(ret))

@@ -25,9 +25,11 @@ from vyper.semantics.types.indexable.sequence import (
     DynamicArrayDefinition,
     TupleDefinition,
 )
-from vyper.semantics.types.value.array_value import BytesArrayDefinition, StringDefinition
+from vyper.semantics.types.value.address import AddressDefinition
 from vyper.semantics.types.value.boolean import BoolDefinition
+from vyper.semantics.types.value.bytes_fixed import Bytes20Definition  # type: ignore
 from vyper.semantics.validation.levenshtein_utils import get_levenshtein_error_suggestions
+from vyper.utils import checksum_encode
 
 
 def _validate_op(node, types_list, validation_fn_name):
@@ -178,11 +180,20 @@ class _ExprTypeChecker:
         return [BoolDefinition()]
 
     def types_from_Compare(self, node):
-        # comparison: `x < y`
+        # comparisons, e.g. `x < y`
+
+        # TODO fixme circular import
+        from vyper.semantics.types.user.enum import EnumDefinition
+
         if isinstance(node.op, (vy_ast.In, vy_ast.NotIn)):
             # x in y
             left = self.get_possible_types_from_node(node.left)
             right = self.get_possible_types_from_node(node.right)
+            if any(isinstance(t, EnumDefinition) for t in left):
+                types_list = get_common_types(node.left, node.right)
+                _validate_op(node, types_list, "validate_comparator")
+                return [BoolDefinition()]
+
             if any(isinstance(i, ArrayDefinition) for i in left):
                 raise InvalidOperation(
                     "Left operand in membership comparison cannot be Array type", node.left
@@ -228,22 +239,16 @@ class _ExprTypeChecker:
         raise InvalidLiteral(f"Could not determine type for literal value '{node.value}'", node)
 
     def types_from_List(self, node):
-        # literal array
 
-        if not node.elements:
+        # literal array
+        if _is_empty_list(node):
             # empty list literal `[]`
             # subtype can be anything
             types_list = types.get_types()
             # 1 is minimum possible length for dynarray, assignable to anything
-            ret = [DynamicArrayDefinition(t, 1) for t in types_list]
+            ret = [DynamicArrayDefinition(v, 1) for v in types_list.values()]
             return ret
-
         types_list = get_common_types(*node.elements)
-
-        # Throw exception if only possible type is String or Bytes
-        if len(types_list) == 1:
-            if isinstance(types_list[0], (StringDefinition, BytesArrayDefinition)):
-                raise StructureException(f"{types_list[0]._id} arrays are not supported", node)
 
         if len(types_list) > 0:
             count = len(node.elements)
@@ -251,7 +256,6 @@ class _ExprTypeChecker:
             ret.extend([ArrayDefinition(t, count) for t in types_list])
             ret.extend([DynamicArrayDefinition(t, count) for t in types_list])
             return ret
-
         raise InvalidLiteral("Array contains multiple, incompatible types", node)
 
     def types_from_Name(self, node):
@@ -290,6 +294,18 @@ class _ExprTypeChecker:
         # unary operation: `-foo`
         types_list = self.get_possible_types_from_node(node.operand)
         return _validate_op(node, types_list, "validate_numeric_op")
+
+
+def _is_empty_list(node):
+    # Checks if a node is a `List` node with an empty list for `elements`,
+    # including any nested `List` nodes. ex. `[]` or `[[]]` will return True,
+    # [1] will return False.
+    if not isinstance(node, vy_ast.List):
+        return False
+
+    if not node.elements:
+        return True
+    return all(_is_empty_list(t) for t in node.elements)
 
 
 def _is_type_in_list(obj, types_list):
@@ -453,9 +469,16 @@ def validate_expected_type(node, expected_type):
             types_str = sorted(str(i) for i in given_types)
             given_str = f"{', '.join(types_str[:1])} or {types_str[-1]}"
 
+        suggestion_str = ""
+        if isinstance(expected_type[0], AddressDefinition) and isinstance(
+            given_types[0], Bytes20Definition
+        ):
+            suggestion_str = f" Did you mean {checksum_encode(node.value)}?"
+
         # CMC 2022-02-14 maybe TypeMismatch would make more sense here
         raise InvalidType(
-            f"Expected {expected_str} but literal can only be cast as {given_str}", node
+            f"Expected {expected_str} but literal can only be cast as {given_str}.{suggestion_str}",
+            node,
         )
 
 

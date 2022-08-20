@@ -42,6 +42,7 @@ no-optimize        - Do not optimize (don't use this for production code)
 combined_json_outputs = [
     "bytecode",
     "bytecode_runtime",
+    "blueprint_bytecode",
     "abi",
     "layout",
     "source_map",
@@ -110,8 +111,8 @@ def _parse_args(argv):
         type=int,
     )
     parser.add_argument(
-        "--debug",
-        help="Turn on compiler debug information. "
+        "--verbose",
+        help="Turn on compiler verbose output. "
         "Currently an alias for --traceback-limit but "
         "may add more information in the future",
         action="store_true",
@@ -133,7 +134,7 @@ def _parse_args(argv):
         sys.tracebacklimit = args.traceback_limit
     elif VYPER_TRACEBACK_LIMIT is not None:
         sys.tracebacklimit = VYPER_TRACEBACK_LIMIT
-    elif args.debug:
+    elif args.verbose:
         sys.tracebacklimit = 1000
     else:
         # Python usually defaults sys.tracebacklimit to 1000.  We use a default

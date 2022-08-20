@@ -69,6 +69,43 @@ def data() -> int128:
     return -1""",
         7,
     ),
+    (
+        # test variable string dynarray
+        """
+@external
+def data() -> String[33]:
+    xs: DynArray[String[33], 3] = ["hello", ",", "world"]
+    for x in xs:
+        if x == ",":
+            return x
+    return ""
+    """,
+        ",",
+    ),
+    (
+        # test literal string dynarray
+        """
+@external
+def data() -> String[33]:
+    for x in ["hello", ",", "world"]:
+        if x == ",":
+            return x
+    return ""
+    """,
+        ",",
+    ),
+    (
+        # test nested string dynarray
+        """
+@external
+def data() -> DynArray[String[33], 2]:
+    for x in [["hello", "world"], ["goodbye", "world!"]]:
+        if x[1] == "world":
+            return x
+    return []
+    """,
+        ["hello", "world"],
+    ),
     # test nested array
     (
         """
@@ -717,7 +754,7 @@ def foo():
 @external
 def test_for() -> int128:
     a: int128 = 0
-    for i in range(MAX_INT128, MAX_INT128+2):
+    for i in range(max_value(int128), max_value(int128)+2):
         a = i
     return a
     """,
